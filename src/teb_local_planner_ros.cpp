@@ -76,7 +76,10 @@ TebLocalPlannerROS::TebLocalPlannerROS()
       goal_reached_(false),
       no_infeasible_plans_(0),
       last_preferred_rotdir_(RotType::none),
-      initialized_(false) {}
+      initialized_(false),
+      new_global_plan_(false),
+      need_rotation_(false),
+      global_goal_position_arrived_(false) {}
 
 TebLocalPlannerROS::~TebLocalPlannerROS() {}
 
@@ -210,6 +213,9 @@ void TebLocalPlannerROS::initialize(std::string name, tf2_ros::Buffer* tf,
 
     // set initialized flag
     initialized_ = true;
+    new_global_plan_ = false;
+    need_rotation_ = false;
+    global_goal_position_arrived_ = false;
 
     ROS_DEBUG("teb_local_planner plugin initialized.");
   } else {
@@ -238,6 +244,8 @@ bool TebLocalPlannerROS::setPlan(
 
   // reset goal_reached_ flag
   goal_reached_ = false;
+  new_global_plan_ = true;
+  global_goal_position_arrived_ = false;
 
   return true;
 }
@@ -285,6 +293,23 @@ uint32_t TebLocalPlannerROS::computeVelocityCommands(
   robot_vel_.linear.y = robot_vel_tf.pose.position.y;
   robot_vel_.angular.z = tf2::getYaw(robot_vel_tf.pose.orientation);
 
+  // TODO: add by gaojie at 2025.05.16
+  // 重新计算全局轨迹终点角度，避免在终点处V字形掉头。
+  if (new_global_plan_ && global_plan_.size() > 2) {
+    global_goal_ = global_plan_.back();
+    auto size = global_plan_.size();
+    // 注意:p0和p1可能是同一个点，改用3个点(p2-p0)判断。
+    auto p0 = global_plan_[size - 3];
+    auto p1 = global_plan_[size - 2];
+    auto p2 = global_plan_[size - 1];
+    double theta = std::atan2(p2.pose.position.y - p0.pose.position.y,
+                              p2.pose.position.x - p0.pose.position.x);
+    tf2::Quaternion q;
+    q.setRPY(0, 0, theta);
+    tf2::convert(q, global_plan_.back().pose.orientation);
+    ROS_WARN("reinit global plan orientation(%f).", theta * 180.0 / M_PI);
+  }
+
   // prune global plan to cut off parts of the past (spatially before the robot)
   pruneGlobalPlan(*tf_, robot_pose, global_plan_,
                   cfg_.trajectory.global_plan_prune_distance);
@@ -313,23 +338,53 @@ uint32_t TebLocalPlannerROS::computeVelocityCommands(
   odom_helper_.getOdom(base_odom);
 
   // check if global goal is reached
-  geometry_msgs::PoseStamped global_goal;
-  tf2::doTransform(global_plan_.back(), global_goal, tf_plan_to_global);
+  // geometry_msgs::PoseStamped global_goal;
+  // tf2::doTransform(global_plan_.back(), global_goal, tf_plan_to_global);
+  geometry_msgs::PoseStamped global_goal = global_goal_;
   double dx = global_goal.pose.position.x - robot_pose_.x();
   double dy = global_goal.pose.position.y - robot_pose_.y();
   double delta_orient = g2o::normalize_theta(
       tf2::getYaw(global_goal.pose.orientation) - robot_pose_.theta());
-  if (fabs(std::sqrt(dx * dx + dy * dy)) <
-          cfg_.goal_tolerance.xy_goal_tolerance &&
-      fabs(delta_orient) < cfg_.goal_tolerance.yaw_goal_tolerance &&
-      (!cfg_.goal_tolerance.complete_global_plan || via_points_.size() == 0) &&
-      (base_local_planner::stopped(base_odom,
-                                   cfg_.goal_tolerance.theta_stopped_vel,
-                                   cfg_.goal_tolerance.trans_stopped_vel) ||
-       cfg_.goal_tolerance.free_goal_vel)) {
-    goal_reached_ = true;
+
+  // TODO: add by gaojie at 2025.05.16
+  // 将teb控制阶段解耦，增加终点处原地旋转逻辑，避免在终点处V字形掉头。以及终点处来回振荡问题。
+  // if (fabs(std::sqrt(dx * dx + dy * dy)) <
+  //         cfg_.goal_tolerance.xy_goal_tolerance &&
+  //     fabs(delta_orient) < cfg_.goal_tolerance.yaw_goal_tolerance &&
+  //     (!cfg_.goal_tolerance.complete_global_plan || via_points_.size() == 0)
+  //     && (base_local_planner::stopped(base_odom,
+  //                                  cfg_.goal_tolerance.theta_stopped_vel,
+  //                                  cfg_.goal_tolerance.trans_stopped_vel) ||
+  //      cfg_.goal_tolerance.free_goal_vel)) {
+  //   goal_reached_ = true;
+  //   return mbf_msgs::ExePathResult::SUCCESS;
+  // }
+  if (!global_goal_position_arrived_ &&
+      fabs(std::sqrt(dx * dx + dy * dy)) <
+          cfg_.goal_tolerance.xy_goal_tolerance)
+    global_goal_position_arrived_ = true;
+
+  if (global_goal_position_arrived_) {
+    double to_angle_scale = 180.0 / M_PI;
+    if (fabs(delta_orient) < cfg_.goal_tolerance.yaw_goal_tolerance) {
+      cmd_vel.twist.linear.x = 0.0;
+      cmd_vel.twist.angular.z = 0.0;
+      goal_reached_ = true;
+    } else {
+      cmd_vel.twist.linear.x = 0.0;
+      cmd_vel.twist.angular.z = 0.8 * g2o::sign(delta_orient);
+    }
+
+    ROS_WARN("stage=[goal], dangle(%f), twist(%f, %f)",
+             delta_orient * to_angle_scale, cmd_vel.twist.linear.x,
+             cmd_vel.twist.angular.z);
     return mbf_msgs::ExePathResult::SUCCESS;
   }
+
+  // TODO: add by gaojie at 2025.05.16。
+  // 增加原地旋转特性，避免导航过程中在起点V字型掉头。
+  if (needRotationInPlace(transformed_plan, robot_pose, cmd_vel))
+    return mbf_msgs::ExePathResult::SUCCESS;
 
   // check if we should enter any backup mode and apply settings
   configureBackupModes(transformed_plan, goal_idx);
@@ -1099,6 +1154,65 @@ void TebLocalPlannerROS::configureBackupModes(
       ROS_INFO("TebLocalPlannerROS: oscillation recovery disabled/expired.");
     }
   }
+}
+
+bool TebLocalPlannerROS::needRotationInPlace(
+    const std::vector<geometry_msgs::PoseStamped>& transformed_plan,
+    const geometry_msgs::PoseStamped& robot_pose,
+    geometry_msgs::TwistStamped& cmd_vel) {
+  if (new_global_plan_) {
+    new_global_plan_ = false;
+
+    // 至少需要2个点计算起点的朝向，虽然可能轨迹点朝向已经重计算过了。
+    if (transformed_plan.size() > 1) {
+      double start_theta = atan2(transformed_plan[1].pose.position.y -
+                                     transformed_plan[1].pose.position.y,
+                                 transformed_plan[0].pose.position.x -
+                                     transformed_plan[0].pose.position.x);
+      double robot_theta = tf2::getYaw(robot_pose.pose.orientation);
+      double diff_theta = g2o::normalize_theta(start_theta - robot_theta);
+      double to_angle_scale = 180.0 / M_PI;
+      ROS_WARN("start_theta(%f), robot_theta(%f), diff(%f)",
+               start_theta * to_angle_scale, robot_theta * to_angle_scale,
+               diff_theta * to_angle_scale);
+
+      if (fabs(diff_theta * to_angle_scale) >= 40.0) {
+        need_rotation_ = true;
+        ROS_WARN("need rotation.");
+      }
+    }
+  }
+
+  if (need_rotation_) {
+    double start_theta = atan2(transformed_plan[1].pose.position.y -
+                                   transformed_plan[0].pose.position.y,
+                               transformed_plan[1].pose.position.x -
+                                   transformed_plan[0].pose.position.x);
+    double robot_theta = tf2::getYaw(robot_pose.pose.orientation);
+    double diff_theta = g2o::normalize_theta(start_theta - robot_theta);
+    double to_angle_scale = 180.0 / M_PI;
+    if (fabs(diff_theta * to_angle_scale) < 5) {
+      need_rotation_ = false;
+      cmd_vel.twist.linear.x = 0.0;
+      cmd_vel.twist.angular.z = 0.0;
+    } else {
+      cmd_vel.twist.linear.x = 0.0;
+      cmd_vel.twist.angular.z = 0.8 * g2o::sign(diff_theta);
+    }
+
+    ROS_WARN(
+        "stage=[start] start_theta(%f), robot_theta(%f), diff(%f), rotation "
+        "velocity(%f, "
+        "%f).",
+        start_theta * to_angle_scale, robot_theta * to_angle_scale,
+        diff_theta * to_angle_scale, cmd_vel.twist.linear.x,
+        cmd_vel.twist.angular.z);
+
+    last_cmd_ = cmd_vel.twist;
+    return true;
+  }
+
+  return false;
 }
 
 void TebLocalPlannerROS::customObstacleCB(

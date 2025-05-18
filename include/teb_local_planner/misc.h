@@ -42,6 +42,7 @@
 #include <Eigen/Core>
 #include <boost/type_traits.hpp>
 #include <boost/utility.hpp>
+#include <vector>
 
 namespace teb_local_planner {
 

@@ -454,6 +454,11 @@ class TebLocalPlannerROS : public nav_core::BaseLocalPlanner,
   void configureBackupModes(
       std::vector<geometry_msgs::PoseStamped>& transformed_plan, int& goal_idx);
 
+  bool needRotationInPlace(
+      const std::vector<geometry_msgs::PoseStamped>& transformed_plan,
+      const geometry_msgs::PoseStamped& robot_pose,
+      geometry_msgs::TwistStamped& cmd_vel);
+
  private:
   // Definition of member variables
 
@@ -539,6 +544,11 @@ class TebLocalPlannerROS : public nav_core::BaseLocalPlanner,
   // flags
   bool initialized_;  //!< Keeps track about the correct initialization of this
                       //!< class
+
+  bool new_global_plan_;
+  bool need_rotation_;
+  geometry_msgs::PoseStamped global_goal_;
+  bool global_goal_position_arrived_;
 
  public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
