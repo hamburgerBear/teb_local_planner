@@ -1166,8 +1166,8 @@ bool TebLocalPlannerROS::needRotationInPlace(
     // 至少需要2个点计算起点的朝向，虽然可能轨迹点朝向已经重计算过了。
     if (transformed_plan.size() > 1) {
       double start_theta = atan2(transformed_plan[1].pose.position.y -
-                                     transformed_plan[1].pose.position.y,
-                                 transformed_plan[0].pose.position.x -
+                                     transformed_plan[0].pose.position.y,
+                                 transformed_plan[1].pose.position.x -
                                      transformed_plan[0].pose.position.x);
       double robot_theta = tf2::getYaw(robot_pose.pose.orientation);
       double diff_theta = g2o::normalize_theta(start_theta - robot_theta);
